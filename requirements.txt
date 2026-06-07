@@ -3,6 +3,7 @@ uvicorn
 python-multipart
 google-genai
 easyocr
-pydantic
 opencv-python-headless
+pydantic
 python-dotenv
+numpy
