@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-genai
+easyocr
+pydantic
+opencv-python-headless
+python-dotenv
