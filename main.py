@@ -1,143 +1,125 @@
 import os
-import cv2
-import numpy as np
-import easyocr
 import json
+import time
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
-
-# Import the modern Google GenAI SDK
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
 
-# 1. Load local environment variables from the .env file
-load_dotenv()
+# ---------------------------------------------------------
+# 1. INITIALIZATION & SETUP
+# ---------------------------------------------------------
+app = FastAPI(title="Splitzza AI Backend")
 
-# 2. Initialize EasyOCR once when the server boots up
-print("🤖 Loading EasyOCR Models into memory...")
-# Set gpu=True if your laptop has a dedicated NVIDIA graphics card
-reader = easyocr.Reader(['en'], gpu=False) 
-
-# 3. Initialize the Gemini Client
-# It automatically reads the GEMINI_API_KEY variable loaded by dotenv
-client = genai.Client()
-
-# 4. Setup FastAPI Application
-app = FastAPI(title="Splitzza AI Engine", version="1.0")
-
-# Enable Cross-Origin Resource Sharing (CORS)
-# This allows your local React app (port 3000) to securely talk to this API (port 8000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace with your exact frontend URL
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 5. Define Pydantic Schemas for Strict JSON enforcement
-class FoodItem(BaseModel):
-    name: str = Field(description="Cleaned up name of the food item")
-    quantity: float = Field(description="Quantity ordered")
-    price: float = Field(description="Price per single unit")
-    total_value: float = Field(description="Total value for this item")
+# Initialize Gemini Client
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ WARNING: GEMINI_API_KEY environment variable is missing!")
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ---------------------------------------------------------
+# 2. DATA MODELS (Strict Math & Validation)
+# ---------------------------------------------------------
+class ReceiptItem(BaseModel):
+    name: str = Field(description="Expanded name of the item (e.g. MSL = Masala, S/W = Sandwich)")
+    quantity: int = Field(description="Exact quantity ordered.")
+    unit_price: float = Field(description="The cost of ONE unit (The 'Rate' column).")
+    total_price: float = Field(description="Quantity * unit_price (The 'Amount' column).")
+
+class ReceiptMeta(BaseModel):
+    subtotal: Optional[float] = Field(description="The subtotal before taxes", default=0.0)
+    tax: Optional[float] = Field(description="Sum of all taxes (SGST + CGST + VAT)", default=0.0)
+    total: Optional[float] = Field(description="The grand total paid", default=0.0)
+    restaurant_name: Optional[str] = Field(description="The name of the restaurant", default="Unknown")
 
 class SplitzzaReceipt(BaseModel):
-    restaurant_name: str
-    items: List[FoodItem] = Field(description="Extract food/drink items. Ignore totals or headers.")
-    subtotal: Optional[float] = Field(description="Subtotal before taxes")
-    tax: Optional[float] = Field(description="Total tax amount combined")
-    total: float = Field(description="The final total amount paid")
+    is_valid_receipt: bool = Field(description="True if the image is actually a restaurant/grocery bill. False if it is a random photo.", default=True)
+    items: List[ReceiptItem] = Field(description="List of extracted food/drink items", default_factory=list)
+    meta: ReceiptMeta = Field(description="Metadata like totals and restaurant name", default_factory=ReceiptMeta)
 
-# 6. Spatial Grouping Algorithm (From Phase 3)
-def group_text_into_lines(ocr_results, y_threshold=10):
-    items = [{'text': text, 'y_center': (bbox[0][1] + bbox[2][1]) / 2, 'x_start': bbox[0][0]} 
-             for bbox, text, conf in ocr_results]
-    
-    # Sort everything top to bottom
-    items.sort(key=lambda item: item['y_center'])
-    
-    lines, current_line = [], []
-    for item in items:
-        if not current_line:
-            current_line.append(item)
-        else:
-            line_y_average = sum([i['y_center'] for i in current_line]) / len(current_line)
-            # Check if text block belongs on the same horizontal plane
-            if abs(item['y_center'] - line_y_average) <= y_threshold:
-                current_line.append(item)
-            else:
-                lines.append(current_line)
-                current_line = [item]
-    if current_line: 
-        lines.append(current_line)
-        
-    # Sort each row left to right so prices line up correctly after text
-    final_text_lines = []
-    for line in lines:
-        line.sort(key=lambda item: item['x_start'])
-        final_text_lines.append(" ".join([item['text'] for item in line]))
-        
-    return final_text_lines
+# ---------------------------------------------------------
+# 3. API ENDPOINTS
+# ---------------------------------------------------------
+@app.get("/")
+def health_check():
+    return {"status": "online", "app": "Splitzza Backend"}
 
-# 7. The Core API Endpoint
 @app.post("/scan-receipt/", response_model=SplitzzaReceipt)
 async def scan_receipt_api(file: UploadFile = File(...)):
-    """
-    Accepts a raw receipt image binary upload, executes OCR, stabilizes layout structures,
-    and handles semantic entity extraction via Gemini 2.5 Flash.
-    """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be a valid image format.")
-
+    
     try:
-        # Step A: Decode raw incoming network bytes into an OpenCV matrix image
+        # Read the raw image bytes directly
         image_bytes = await file.read()
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        if image is None:
-            raise HTTPException(status_code=400, detail="Failed to parse image file data.")
-
-        # Step B: Compute spatial coordinates and extract raw text blobs via EasyOCR
-        raw_ocr_data = reader.readtext(image)
+        # Convert bytes into a Gemini Vision Part object
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type=file.content_type)
         
-        # Step C: Normalize coordinate variations to group pieces into clean rows
-        structured_lines = group_text_into_lines(raw_ocr_data, y_threshold=10)
-        document_text = "\n".join(structured_lines)
+        # Unified, Bulletproof Prompt (Validation + Strict/Forgiving Math)
+        prompt = """
+        You are an expert data extraction AI specifically trained on Indian restaurant receipts.
+        Analyze the provided image and extract the data into the requested JSON schema.
         
-        # Step D: Construct LLM prompt context
-        prompt = f"""
-        You are a highly accurate receipt parsing AI for a bill-splitting app.
-        Take the following messy OCR text from a restaurant receipt and extract the data structure.
-        Fix obvious spelling mistakes in food items and normalize text.
-        
-        Receipt Text:
-        {document_text}
+        CRITICAL RULES:
+        1. IMAGE VALIDATION (GATEKEEPER): Determine if the image is actually a restaurant or grocery receipt. If it is NOT a receipt (e.g., a person, landscape, dog, or random screenshot), set `is_valid_receipt` to false, leave `items` empty, and set all metadata to 0. DO NOT hallucinate data.
+        2. ITEM-LEVEL MATH (STRICT): Differentiate between 'Rate' (unit price) and 'Amount' (total item price). Ensure that (quantity * unit_price) exactly equals total_price for every single item.
+        3. ABBREVIATIONS: Expand Indian restaurant abbreviations (e.g., 'MSL' -> 'Masala', 'S/W' -> 'Sandwich', 'VDA' -> 'Wada').
+        4. RECEIPT-LEVEL MATH (FORGIVING): Indian bills often have mathematical typos (e.g., the printed Subtotal might say 505 even if the items add up to 605). DO NOT panic if the overall subtotal math doesn't perfectly add up. Trust the printed Tax and Grand Total numbers.
+        5. EXPLICIT TAX EXTRACTION: Search the bottom of the bill for 'SGST', 'CGST', 'IGST', or 'Service Charge'. You MUST extract the numeric values next to these and ADD them together into the 'tax' field. (e.g., If SGST is 15.12 and CGST is 15.12, the tax field is 30.24).
+        6. GRAND TOTAL: Extract the final billed amount (e.g., 635) and put it in the 'total' field. Ignore FSSAI numbers and addresses.
         """
 
-        # Step E: Query Gemini with structural enforcement configurations
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=SplitzzaReceipt, 
-                temperature=0.0 
-            ),
-        )
+        max_attempts = 4
+        base_delay = 3 
         
-        # Step F: Transform response text string safely into native dictionary object for FastAPI output routing
-        return json.loads(response.text)
+        for attempt in range(max_attempts):
+            try:
+                # Pass BOTH the prompt and the image_part to the multimodal model
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash', 
+                    contents=[prompt, image_part],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=SplitzzaReceipt, 
+                        temperature=0.0 # Keep at 0 for strict data extraction
+                    ),
+                )
+                return json.loads(response.text)
+                
+            except Exception as api_error:
+                error_message = str(api_error)
+                print(f"⚠️ API Error (Attempt {attempt + 1}/{max_attempts}): {error_message}")
+                
+                if "429" in error_message or "RESOURCE_EXHAUSTED" in error_message:
+                    print("🛑 Rate limit hit. Halting retries.")
+                    raise HTTPException(
+                        status_code=429, 
+                        detail="You have exceeded the free AI scanning limit. Please wait 60 seconds and try again."
+                    )
+                if attempt < max_attempts - 1:
+                    wait_time = base_delay * (2 ** attempt) 
+                    time.sleep(wait_time)
+                    continue
+                
+                raise HTTPException(
+                    status_code=503, 
+                    detail="The AI server is currently congested. Please try again in a minute."
+                )
 
+    except HTTPException as http_exc:
+        raise http_exc
+            
     except Exception as e:
         print(f"🚨 API Runtime Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal AI processing pipeline failure: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    # This tells Python to start the server on port 8000 and stay alive
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        raise HTTPException(status_code=500, detail=f"Internal AI processing failure: {str(e)}")
